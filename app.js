@@ -1,10 +1,14 @@
 /**
- * Copyright (c) 2014-2016 by the respective copyright holders.
+ * Copyright (c) 2010-2019 Contributors to the openHAB project
  *
- * All rights reserved. This program and the accompanying materials
- * are made available under the terms of the Eclipse Public License v1.0
- * which accompanies this distribution, and is available at
- * http://www.eclipse.org/legal/epl-v10.html
+ * See the NOTICE file(s) distributed with this work for additional
+ * information.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0
+ *
+ * SPDX-License-Identifier: EPL-2.0
  */
 
 /**
@@ -54,9 +58,9 @@ logger.info('openHAB-cloud: Backend logging initialized...');
 // Initialize the main configuration
 var taskEnv = process.env.TASK || 'main';
 
-// If Google Cloud Messaging is configured set it up
+// If Firebase Cloud Messaging is configured set it up
 if (system.isGcmConfigured()) {
-    require('./gcm-xmpp');
+    require('./fcm-xmpp');
 }
 
 module.exports.config = config;
@@ -71,6 +75,7 @@ var flash = require('connect-flash'),
     cookieParser = require('cookie-parser'),
     session = require('express-session'),
     favicon = require('serve-favicon'),
+    firebase = require('./notificationsender/firebase');
     csurf = require('csurf'),
     serveStatic = require('serve-static'),
     homepage = require('./routes/homepage'),
@@ -83,7 +88,7 @@ var flash = require('connect-flash'),
     redis = require('./redis-helper'),
     moment = require('moment'),
     date_util = require('./date_util.js'),
-    appleSender = require('./aps-helper'),
+    appleSender = require('./notificationsender/aps-helper'),
     oauth2 = require('./routes/oauth2'),
     auth = require('./auth.js'),
     Limiter = require('ratelimiter'),
@@ -91,18 +96,17 @@ var flash = require('connect-flash'),
     routes = require('./routes'),
     MongoConnect = require('./system/mongoconnect');
 
-// Setup Google Cloud Messaging component
-var gcm = require('node-gcm');
-var gcmSender = require('./gcmsender.js');
-
 // MongoDB connection settings
 var mongoose = require('mongoose');
-var cacheOpts = {
-    max: 5000,
-    maxAge: 1000 * 60 * 10
-};
-
-require('mongoose-cache').install(mongoose, cacheOpts);
+// MongoDB Caching for Item updates
+var cachegoose = require('cachegoose');
+cachegoose(mongoose, {
+  engine: 'redis',
+  port: config.redis.port, 
+  host: config.redis.host,
+  password: config.redis.password,
+});
+var cacheTTL = config.cacheTTL || 600;
 
 // Try to setup a mongodb connection, otherwise stopping
 var mongoConnect = new MongoConnect(system);
@@ -294,12 +298,13 @@ app.use(function (req, res, next) {
             account: req.user.account
         }).lean().exec(function (error, openhab) {
             res.locals.baseurl = system.getBaseURL();
+            res.locals.proxyUrl = system.getProxyURL();
             if (!error && openhab) {
                 res.locals.openhab = openhab;
                 res.locals.openhabstatus = openhab.status;
                 res.locals.openhablastonline = openhab.last_online;
                 if (openhab.openhabVersion !== undefined) {
-                    res.locals.openhabMajorVersion = openhab.openhabVersion.split('.')[0];
+                    res.locals.openhabMajorVersion = parseInt(openhab.openhabVersion.split('.')[0]);
                 } else {
                     res.locals.openhabMajorVersion = 0;
                 }
@@ -354,7 +359,7 @@ rt.setupRoutes(app);
 function sendNotificationToUser(user, message, icon, severity) {
     var androidRegistrations = [];
     var iosDeviceTokens = [];
-    newNotification = new Notification({
+    var newNotification = new Notification({
         user: user.id,
         message: message,
         icon: icon,
@@ -386,42 +391,28 @@ function sendNotificationToUser(user, message, icon, severity) {
         }
         // If we found any android devices, send notification
         if (androidRegistrations.length > 0) {
-            sendAndroidNotifications(androidRegistrations, message);
+            firebase.sendNotification(androidRegistrations, newNotification);
         }
         // If we found any ios devices, send notification
         if (iosDeviceTokens.length > 0) {
-            sendIosNotifications(iosDeviceTokens, message);
+            sendIosNotifications(iosDeviceTokens, newNotification);
         }
     });
 }
 
-function sendIosNotifications(iosDeviceTokens, message) {
-    for (var i = 0; i < iosDeviceTokens.length; i++) {
-        if (config.apn) {
-            appleSender.sendAppleNotification(iosDeviceTokens[i], message);
-        }
+function sendIosNotifications(iosDeviceTokens, notification) {
+    if (!config.apn) {
+        return;
     }
-}
-
-function sendAndroidNotifications(registrationIds, message) {
-    redis.incr('androidNotificationId', function (error, androidNotificationId) {
-        if (!config.gcm || error) {
-            return;
-        }
-        var gcmMessage = new gcm.Message({
-            delayWhileIdle: false,
-            data: {
-                type: 'notification',
-                notificationId: androidNotificationId,
-                message: message
-            }
-        });
-        gcmSender.send(gcmMessage, registrationIds, 4, function (err, result) {
-            if (err) {
-                logger.error('openHAB-cloud: GCM send error: ' + err);
-            }
-        });
-    });
+    var payload = {
+        severity: notification.severity,
+        icon: notification.icon,
+        persistedId: notification._id,
+        timestamp: notification.created.getTime()
+    };
+    for (var i = 0; i < iosDeviceTokens.length; i++) {
+        appleSender.sendAppleNotification(iosDeviceTokens[i], notification.message, payload);
+    }
 }
 
 // In case of polling transport set poll duration to 300 seconds
@@ -680,72 +671,79 @@ io.sockets.on('connection', function (socket) {
     });
 
     socket.on('broadcastnotification', function (data) {
-        var self = this;
-        Openhab.findById(self.openhabId, function (error, openhab) {
+        Openhab.findById(this.openhabId, function (error, openhab) {
             if (error) {
                 logger.error('openHAB-cloud: openHAB lookup error: ' + error);
                 return;
             }
             if (!openhab) {
                 logger.debug('openHAB-cloud: openHAB not found');
+                return;
             }
 
             User.find({
                 account: openhab.account
             }, function (error, users) {
-                if (!error && users) {
-                    for (var i = 0; i < users.length; i++) {
-                        sendNotificationToUser(users[i], data.message, data.icon, data.severity);
-                    }
-                } else {
-                    if (error) {
-                        logger.error('openHAB-cloud: Error getting users list: ' + error);
-                    } else {
-                        logger.debug('openHAB-cloud: No users found for openHAB');
-                    }
+                if (error) {
+                    logger.error('openHAB-cloud: Error getting users list: ' + error);
+                    return;
+                }
+
+                if (!users) {
+                    logger.debug('openHAB-cloud: No users found for openHAB');
+                    return;
+                }
+
+                for (var i = 0; i < users.length; i++) {
+                    sendNotificationToUser(users[i], data.message, data.icon, data.severity);
                 }
             });
         });
     });
 
     socket.on('lognotification', function (data) {
-        var self = this;
-        Openhab.findById(self.openhabId, function (error, openhab) {
+        Openhab.findById(this.openhabId, function (error, openhab) {
             if (error) {
                 logger.error('openHAB lookup error: ' + error);
+                return;
             }
             if (!openhab) {
                 logger.debug('openHAB not found');
+                return;
             }
             User.find({
                 account: openhab.account
             }, function (error, users) {
-                if (!error && users) {
-                    for (var i = 0; i < users.length; i++) {
-                        newNotification = new Notification({
-                            user: users[i].id,
-                            message: data.message,
-                            icon: data.icon,
-                            severity: data.severity
-                        });
-                        newNotification.save(function (error) {
-                            if (error) {
-                                logger.error('Error saving notification: ' + error);
-                            }
-                        });
-                    }
-                } else {
-                    if (error) {
-                        logger.error('Error getting users list: ' + error);
-                    } else {
-                        logger.debug('No users found for openhab');
-                    }
+                if (error) {
+                    logger.error('openHAB-cloud: Error getting users list: ' + error);
+                    return;
+                }
+
+                if (!users) {
+                    logger.debug('openHAB-cloud: No users found for openHAB');
+                    return;
+                }
+
+                for (var i = 0; i < users.length; i++) {
+                    newNotification = new Notification({
+                        user: users[i].id,
+                        message: data.message,
+                        icon: data.icon,
+                        severity: data.severity
+                    });
+                    newNotification.save(function (error) {
+                        if (error) {
+                            logger.error('Error saving notification: ' + error);
+                        }
+                    });
                 }
             });
         });
     });
 
     socket.on('itemupdate', function (data) {
+        //disabling item updates for now
+        return;
         var self = this;
         //if openhabId is missing then user has not completed auth
         if (self.openhabId === undefined) {
@@ -754,8 +752,8 @@ io.sockets.on('connection', function (socket) {
         var limiter = new Limiter({
             id: self.openhabId,
             db: redis,
-            max: 20,
-            duration: 60000
+            max: 10,
+            duration: 30000
         });
         limiter.get(function (err, limit) {
             if (err) {
@@ -772,7 +770,7 @@ io.sockets.on('connection', function (socket) {
                 logger.info('openHAB-cloud: Item ' + itemName + ' status.length (' + (itemStatus ? itemStatus.length : 'null') + ') is too big or null, ignoring update');
                 return;
             }
-            Openhab.findById(self.openhabId).cache().exec(function (error, openhab) {
+            Openhab.findById(self.openhabId).cache(cacheTTL).exec(function (error, openhab) {
                 if (error) {
                     logger.warn('openHAB-cloud: Unable to find openHAB for itemUpdate: ' + error);
                     return;
@@ -782,10 +780,11 @@ io.sockets.on('connection', function (socket) {
                     return;
                 }
                 // Find the item (which should belong to this openhab)
+                var cacheKey = openhab.id + '-' + itemName;
                 Item.findOne({
                     openhab: openhab.id,
                     name: itemName
-                }).cache().exec(function (error, itemToUpdate) {
+                }).cache(cacheTTL, cacheKey).exec(function (error, itemToUpdate) {
                     if (error) {
                         logger.warn('openHAB-cloud: Unable to find item for itemUpdate: ' + error);
                     }
@@ -813,6 +812,7 @@ io.sockets.on('connection', function (socket) {
                             if (error) {
                                 logger.error('openHAB-cloud: Error saving item: ' + error);
                             }
+                            cachegoose.clearCache(cacheKey);
                         });
                         // Check if the new state is int or float to store it to Number and create new item update event
                         if (!isNaN(parseFloat(itemStatus))) {
